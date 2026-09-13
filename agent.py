@@ -17,10 +17,25 @@ _IDLE_EMOTES = tuple(emote for emote in action.EMOTES if emote != "sleep")
 _TASK_TYPES = frozenset(
     {"plot", "shrine", "pump", "bell", "stall", "lantern", "hearth", "bench", "repair_bench", "board"}
 )
+# Each prop's untouched state. Anything else means another villager already handled it (a tended
+# plot, a lit lantern) or is on it right now (an occupied bench), so there is no work left here.
+_PROP_START_STATE = {
+    "stall": "closed",
+    "lantern": "unlit",
+    "bench": "empty",
+    "shrine": "untended",
+    "plot": "overgrown",
+    "hearth": "unlit",
+    "repair_bench": "idle",
+    "pump": "idle",
+    "bell": "silent",
+}
 _STUCK_TICKS_LIMIT = 30  # abandon a destination after this many ticks of near-zero movement
 _GREET_COOLDOWN_TICKS = 100  # per person, so a lingering neighbour isn't greeted every tick
 _STARTLE_COOLDOWN_TICKS = 20  # separate & shorter, so startling doesn't use up the greet cooldown
 _GREET_DELAY_TICKS = 10  # beat spent facing someone after noticing them, before actually greeting
+_VISITOR_APPROACH_RANGE = 8.0  # blocks; only detour to greet if visitor is this close when noticed
+_VISITOR_GREET_DISTANCE = 2.0  # blocks; walk to this distance before actually greeting
 _BELL_RANGE = 50.0  # blocks; how far a villager will detour to answer a ringing bell
 _RETURN_HOME_TICK = 1000  # of the 1200-tick day; when villagers head home for the "night"
 
@@ -29,6 +44,20 @@ def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
     """Return the point at the centre of one village cell."""
 
     return {"x": cell["x"] + 0.5, "y": cell["y"] + 0.5}
+
+
+def _prop_untouched(observation, prop) -> bool:
+    """Whether a prop still needs doing and nobody else is on it.
+
+    ``props.usable`` selects by reach and line of sight alone, regardless of facing, so it can
+    hand back a prop that is not actually in the vision cone. ``props.state`` needs the cone, so
+    that case reads as unknown here -- and an unconfirmed reading is treated as "leave it alone"
+    rather than "assume untouched", since using an already-lit lantern would toggle it back off.
+    """
+    start = _PROP_START_STATE.get(prop["type"])
+    if start is None:
+        return True  # e.g. "board", which has no state to speak of
+    return props.state(observation, prop["id"]) == start
 
 
 def _nearest_walkable_cell(observation, cell, max_radius=15):
@@ -97,7 +126,7 @@ class Agent:
         self.used_props = set()  # prop ids already used today, never repeated
         self.greeted = {}  # {player_id: last_greeted_tick}, per-person greet cooldown
         self.startled = {}  # {player_id: last_startled_tick}, separate from greeted on purpose
-        self.pending_greet = None  # {"id", "ready_tick"} while facing someone before greeting them
+        self.pending_greet = None  # {"id", "ready_tick", "approach_player"?} while greeting
 
         # Destination & task state
         self.current_destination = None  # position dict to walk toward
@@ -200,32 +229,43 @@ class Agent:
         here = me.position(observation)
         tick = day.tick(observation)
         seen = people.seen(observation)
+        nearby = people.nearby(observation)
         seen_ids = {person["id"] for person in seen}
+        # Chat is only delivered to someone in hearing range, so speaking needs this, not sight
+        nearby_ids = {person["id"] for person in nearby}
 
         def find(player_id: str):
             """That person's current record, from sight or hearing, or None once they are gone."""
             for person in seen:
                 if person["id"] == player_id:
                     return person
-            for person in people.nearby(observation):
+            for person in nearby:
                 if person["id"] == player_id:
                     return person
             return None
 
-        # Already noticed someone: hold facing them, then greet once the beat is up
+        # Already noticed someone: walk to them if they started close by, then greet
         if self.pending_greet is not None:
             person = find(self.pending_greet["id"])
             if person is None:
                 self.pending_greet = None  # they left before we could say anything
             else:
                 facing = geometry.heading_to(here, person["position"])
+                dist_to_person = geometry.distance(here, person["position"])
+
+                # If the visitor started within approach range, walk over before greeting
+                if self.pending_greet.get("approach_player") and dist_to_person > _VISITOR_GREET_DISTANCE:
+                    return action.walk(self._walk_toward(person["position"], observation), 1.0, "none")
+
                 if tick < self.pending_greet["ready_tick"]:
                     return action.stand(facing, "none")
+
                 player_id = person["id"]
                 self.greeted[player_id] = tick
                 self.pending_greet = None
                 if people.is_visitor(player_id):
-                    self._pending_chat = {"to": player_id, "text": "Hello."}
+                    if player_id in nearby_ids:  # close enough that a greeting would carry
+                        self._pending_chat = {"to": player_id, "text": "Hello."}
                     return action.stand(facing, "wave")
                 return action.stand(facing, "nod")
 
@@ -237,7 +277,15 @@ class Agent:
 
         def notice(person, expression: str):
             """Turn toward someone and start the beat that ends in a wave or a nod."""
-            self.pending_greet = {"id": person["id"], "ready_tick": tick + _GREET_DELAY_TICKS}
+            approach = (
+                people.is_visitor(person["id"])
+                and geometry.distance(here, person["position"]) <= _VISITOR_APPROACH_RANGE
+            )
+            self.pending_greet = {
+                "id": person["id"],
+                "ready_tick": tick + _GREET_DELAY_TICKS,
+                "approach_player": approach,
+            }
             return action.stand(geometry.heading_to(here, person["position"]), expression)
 
         # The visitor comes first
@@ -251,7 +299,7 @@ class Agent:
 
         # Heard but not seen means they are in the blind spot behind us, so the beat opens with a
         # startle instead. It doesn't use up the greet cooldown, so the wave or nod still follows.
-        for person in people.nearby(observation):
+        for person in nearby:
             if person["id"] in seen_ids:
                 continue
             if startle_due(person["id"]) and greet_due(person["id"]):
@@ -310,7 +358,11 @@ class Agent:
         if self.phase == "wander":
             if self.active_task is None:
                 usable = props.usable(observation)
-                if usable is not None and usable["id"] not in self.used_props:
+                if (
+                    usable is not None
+                    and usable["id"] not in self.used_props
+                    and _prop_untouched(observation, usable)
+                ):
                     self.active_task = {
                         "prop_id": usable["id"],
                         "ticks_remaining": self._prop_use_ticks(usable["type"]),

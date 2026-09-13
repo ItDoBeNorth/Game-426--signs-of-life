@@ -19,6 +19,10 @@ _TASK_TYPES = frozenset(
 )
 _STUCK_TICKS_LIMIT = 30  # abandon a destination after this many ticks of near-zero movement
 _GREET_COOLDOWN_TICKS = 100  # per person, so a lingering neighbour isn't greeted every tick
+_STARTLE_COOLDOWN_TICKS = 20  # separate & shorter, so startling doesn't use up the greet cooldown
+_GREET_DELAY_TICKS = 10  # beat spent facing someone after noticing them, before actually greeting
+_BELL_RANGE = 50.0  # blocks; how far a villager will detour to answer a ringing bell
+_RETURN_HOME_TICK = 1000  # of the 1200-tick day; when villagers head home for the "night"
 
 
 def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
@@ -91,7 +95,9 @@ class Agent:
         # Day-phase tracking
         self.phase = "plot"  # "plot" -> "wander" -> "returning"
         self.used_props = set()  # prop ids already used today, never repeated
-        self.greeted = {}  # {player_id: last_greeted_tick}, per-person 10-tick cooldown
+        self.greeted = {}  # {player_id: last_greeted_tick}, per-person greet cooldown
+        self.startled = {}  # {player_id: last_startled_tick}, separate from greeted on purpose
+        self.pending_greet = None  # {"id", "ready_tick"} while facing someone before greeting them
 
         # Destination & task state
         self.current_destination = None  # position dict to walk toward
@@ -172,6 +178,19 @@ class Agent:
             return _cell_centre(_nearest_walkable_cell(observation, cell))
         return here
 
+    def _bell_destination(self, observation: ThreeBranchesObservation) -> dict[str, float] | None:
+        """If the bell is ringing and within range, head there; otherwise None."""
+        if not day.bell_ringing(observation):
+            return None
+        here = me.position(observation)
+        bell = next((prop for prop in props.all(observation) if prop["type"] == "bell"), None)
+        if bell is None:
+            return None
+        bell_pos = _cell_centre(bell["cell"])
+        if geometry.distance(here, bell_pos) > _BELL_RANGE:
+            return None
+        return bell_pos
+
     def _react_to_people(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction | None:
         """Stop and turn toward whoever just showed up, or None when nobody is due a reaction.
 
@@ -183,26 +202,61 @@ class Agent:
         seen = people.seen(observation)
         seen_ids = {person["id"] for person in seen}
 
-        def due(player_id: str) -> bool:
+        def find(player_id: str):
+            """That person's current record, from sight or hearing, or None once they are gone."""
+            for person in seen:
+                if person["id"] == player_id:
+                    return person
+            for person in people.nearby(observation):
+                if person["id"] == player_id:
+                    return person
+            return None
+
+        # Already noticed someone: hold facing them, then greet once the beat is up
+        if self.pending_greet is not None:
+            person = find(self.pending_greet["id"])
+            if person is None:
+                self.pending_greet = None  # they left before we could say anything
+            else:
+                facing = geometry.heading_to(here, person["position"])
+                if tick < self.pending_greet["ready_tick"]:
+                    return action.stand(facing, "none")
+                player_id = person["id"]
+                self.greeted[player_id] = tick
+                self.pending_greet = None
+                if people.is_visitor(player_id):
+                    self._pending_chat = {"to": player_id, "text": "Hello."}
+                    return action.stand(facing, "wave")
+                return action.stand(facing, "nod")
+
+        def greet_due(player_id: str) -> bool:
             return tick - self.greeted.get(player_id, -_GREET_COOLDOWN_TICKS) >= _GREET_COOLDOWN_TICKS
 
-        # The visitor comes first: wave, and hand chat() a greeting to send this tick
+        def startle_due(player_id: str) -> bool:
+            return tick - self.startled.get(player_id, -_STARTLE_COOLDOWN_TICKS) >= _STARTLE_COOLDOWN_TICKS
+
+        def notice(person, expression: str):
+            """Turn toward someone and start the beat that ends in a wave or a nod."""
+            self.pending_greet = {"id": person["id"], "ready_tick": tick + _GREET_DELAY_TICKS}
+            return action.stand(geometry.heading_to(here, person["position"]), expression)
+
+        # The visitor comes first
         visitor = next((person for person in seen if people.is_visitor(person["id"])), None)
-        if visitor is not None and due(visitor["id"]):
-            self.greeted[visitor["id"]] = tick
-            self._pending_chat = {"to": visitor["id"], "text": "Hello."}
-            return action.stand(geometry.heading_to(here, visitor["position"]), "wave")
+        if visitor is not None and greet_due(visitor["id"]):
+            return notice(visitor, "none")
 
         for person in seen:
-            if not people.is_visitor(person["id"]) and due(person["id"]):
-                self.greeted[person["id"]] = tick
-                return action.stand(geometry.heading_to(here, person["position"]), "nod")
+            if not people.is_visitor(person["id"]) and greet_due(person["id"]):
+                return notice(person, "none")
 
-        # Heard but not seen means they are in the blind spot behind us, so startle
+        # Heard but not seen means they are in the blind spot behind us, so the beat opens with a
+        # startle instead. It doesn't use up the greet cooldown, so the wave or nod still follows.
         for person in people.nearby(observation):
-            if person["id"] not in seen_ids and due(person["id"]):
-                self.greeted[person["id"]] = tick
-                return action.stand(geometry.heading_to(here, person["position"]), "startle")
+            if person["id"] in seen_ids:
+                continue
+            if startle_due(person["id"]) and greet_due(person["id"]):
+                self.startled[person["id"]] = tick
+                return notice(person, "startle")
 
         return None
 
@@ -215,6 +269,14 @@ class Agent:
         reaction = self._react_to_people(observation)
         if reaction is not None:
             return reaction
+
+        if self.phase != "returning" and day.tick(observation) >= _RETURN_HOME_TICK:
+            # Time to head home, whatever else was in progress
+            self.phase = "returning"
+            self.active_task = None
+            self.current_destination = None
+            self._path = None
+            self.stuck_ticks = 0
 
         # Phase: plot (tend the home plot, then switch to wander)
         if self.phase == "plot":
@@ -264,6 +326,12 @@ class Agent:
                     self.use_counter += 1
                     return action.stand(heading, "use")
 
+            bell_destination = self._bell_destination(observation)
+            if bell_destination is not None and self.current_destination != bell_destination:
+                self.current_destination = bell_destination
+                self._path = None
+                self.stuck_ticks = 0
+
             if self.current_destination is None:
                 # Deciding beat: pick where to head next and show it with a random emote
                 self.current_destination = self._pick_destination(observation)
@@ -289,7 +357,16 @@ class Agent:
 
             return action.walk(self._walk_toward(self.current_destination, observation), 1.0, "none")
 
-        # Placeholder for the returning phase (step 7)
+        # Phase: returning (walk home for the night, then sleep for the rest of the day)
+        if self.phase == "returning":
+            if self.home_doorway is None:  # no home to return to (e.g. the visitor seat)
+                return action.stand(heading, "sleep")
+            here_cell = layout.cell_at(observation, here)
+            ground = layout.ground_at(observation, here_cell) if here_cell is not None else None
+            if ground == "interior" or geometry.distance(here, self.home_doorway) < 1.0:
+                return action.stand(heading, "sleep")
+            return action.walk(self._walk_toward(self.home_doorway, observation), 1.0, "none")
+
         return action.stand(heading, "none")
 
     # Optional: messaging. On your turn, chat receives messages addressed to your player since

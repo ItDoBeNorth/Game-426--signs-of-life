@@ -1,9 +1,22 @@
 """A small Days at Three Branches starter built entirely from ``sandbox.village``."""
 
+import math
 from collections import deque
 
 from sandbox.observation_types import ThreeBranchesAction, ThreeBranchesObservation
 from sandbox.village import action, geometry, layout, me, people, props
+
+# Duration (in ticks) to hold "use" on a prop, by its transition type. Timed props use
+# duration/4 so villagers don't stall for the full catalog duration; toggle/occupancy get a
+# short fixed hold. "sleep" is reserved for the end-of-day return home, not idle flavor.
+_TIMED_USE_TICKS = {"plot": 150, "shrine": 75, "bell": 10, "pump": 3}
+_TOGGLE_TYPES = ("lantern", "hearth", "stall")
+_OCCUPANCY_TYPES = ("bench", "repair_bench")
+_IDLE_EMOTES = tuple(emote for emote in action.EMOTES if emote != "sleep")
+_TASK_TYPES = frozenset(
+    {"plot", "shrine", "pump", "bell", "stall", "lantern", "hearth", "bench", "repair_bench", "board"}
+)
+_STUCK_TICKS_LIMIT = 30  # abandon a destination after this many ticks of near-zero movement
 
 
 def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
@@ -12,7 +25,18 @@ def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
     return {"x": cell["x"] + 0.5, "y": cell["y"] + 0.5}
 
 
-def _nearest_walkable_cell(observation, cell, max_radius=6):
+def _prop_use_ticks(prop_type: str) -> int:
+    """How many ticks to hold "use" on a prop, based on its catalog transition type."""
+    if prop_type in _TIMED_USE_TICKS:
+        return _TIMED_USE_TICKS[prop_type]
+    if prop_type in _TOGGLE_TYPES:
+        return 3
+    if prop_type in _OCCUPANCY_TYPES:
+        return 4
+    return 1  # e.g. "board": no state to hold, just a passing glance
+
+
+def _nearest_walkable_cell(observation, cell, max_radius=15):
     """Return the closest walkable cell to one that may itself be blocked (e.g. a prop's footprint)."""
     if layout.walkable(observation, cell):
         return cell
@@ -86,6 +110,7 @@ class Agent:
         # Pathfinding cache
         self._path = None  # cached cardinal-step path to current destination
         self._path_destination = None  # (x, y) tuple of cached path's target
+        self.stuck_ticks = 0  # consecutive near-zero-movement ticks while walking a destination
 
     def _walk_toward(self, destination: dict[str, float], observation: ThreeBranchesObservation) -> float:
         """Heading toward destination, following a cached path around obstacles."""
@@ -107,6 +132,41 @@ class Agent:
         if not self._path:
             return geometry.heading_to(here, destination)
         return geometry.heading_to(here, _cell_centre(self._path[0]))
+
+    def _pick_destination(self, observation: ThreeBranchesObservation) -> dict[str, float]:
+        """Pick the next place to head, per this villager's personality. Always returns an
+        actually-walkable point, since a prop or building cell can itself be blocked by
+        collision (a raw prop cell led to villagers oscillating against it)."""
+        here = me.position(observation)
+
+        if self.personality == "wander_random":
+            for _ in range(20):
+                angle = math.radians(self.rng.uniform(0.0, 360.0))
+                reach = self.rng.uniform(5.0, 30.0)
+                point = {"x": here["x"] + reach * math.cos(angle), "y": here["y"] + reach * math.sin(angle)}
+                cell = layout.cell_at(observation, point)
+                if cell is not None and layout.walkable(observation, cell):
+                    return _cell_centre(cell)
+            return here
+
+        if self.personality == "visit_building":
+            candidates = list(layout.buildings(observation))
+            self.rng.shuffle(candidates)
+            for building in candidates:
+                doorway = layout.doorway(observation, building["id"])
+                if doorway is not None:
+                    return doorway
+            return here
+
+        # "seek_tasks"
+        candidates = [
+            prop for prop in props.all(observation)
+            if prop["type"] in _TASK_TYPES and prop["id"] not in self.used_props
+        ]
+        if candidates:
+            cell = self.rng.choice(candidates)["cell"]
+            return _cell_centre(_nearest_walkable_cell(observation, cell))
+        return here
 
     def act(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
         """Choose one action from current observation and persistent day state."""
@@ -138,7 +198,50 @@ class Agent:
                 else:
                     return action.walk(self._walk_toward(plot_pos, observation), 1.0, "none")
 
-        # Placeholder for wander/returning phases (steps 4, 7)
+        # Phase: wander (walk to a personality-driven destination, using anything usable
+        # spotted along the way, sweeping at the end of each leg, then picking a new one)
+        if self.phase == "wander":
+            if self.active_task is None:
+                usable = props.usable(observation)
+                if usable is not None and usable["id"] not in self.used_props:
+                    self.active_task = {"prop_id": usable["id"], "ticks_remaining": _prop_use_ticks(usable["type"])}
+                    self.use_counter = 0
+
+            if self.active_task is not None:
+                if self.use_counter >= self.active_task["ticks_remaining"]:
+                    self.used_props.add(self.active_task["prop_id"])
+                    self.active_task = None
+                    self.use_counter = 0
+                else:
+                    self.use_counter += 1
+                    return action.stand(heading, "use")
+
+            if self.current_destination is None:
+                # Deciding beat: pick where to head next and show it with a random emote
+                self.current_destination = self._pick_destination(observation)
+                self.stuck_ticks = 0
+                self._path = None  # force a fresh path for the new destination
+                return action.stand(heading, self.rng.choice(_IDLE_EMOTES))
+
+            if geometry.distance(here, self.current_destination) < 2.0:
+                # Arrived: sweep, then pick a fresh destination next tick
+                self.current_destination = None
+                return action.stand(heading, "sweep")
+
+            # Give up on a destination that isn't actually reachable instead of circling on it
+            if me.moved(observation) < 0.05:
+                self.stuck_ticks += 1
+            else:
+                self.stuck_ticks = 0
+            if self.stuck_ticks >= _STUCK_TICKS_LIMIT:
+                self.current_destination = None
+                self.stuck_ticks = 0
+                self._path = None
+                return action.stand(heading, "shrug")
+
+            return action.walk(self._walk_toward(self.current_destination, observation), 1.0, "none")
+
+        # Placeholder for the returning phase (step 7)
         return action.stand(heading, "none")
 
     # Optional: messaging. On your turn, chat receives messages addressed to your player since

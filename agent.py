@@ -4,12 +4,13 @@ import math
 from collections import deque
 
 from sandbox.observation_types import ThreeBranchesAction, ThreeBranchesObservation
-from sandbox.village import action, geometry, layout, me, people, props
+from sandbox.village import action, day, geometry, layout, me, people, props
 
 # Duration (in ticks) to hold "use" on a prop, by its transition type. Timed props use
-# duration/4 so villagers don't stall for the full catalog duration; toggle/occupancy get a
-# short fixed hold. "sleep" is reserved for the end-of-day return home, not idle flavor.
-_TIMED_USE_TICKS = {"plot": 150, "shrine": 75, "bell": 10, "pump": 3}
+# duration/4 so villagers don't stall for the full catalog duration (plot is shortened further,
+# to 100); toggle/occupancy get a short hold. "sleep" is reserved for the end-of-day return
+# home, not idle flavor.
+_TIMED_USE_TICKS = {"plot": 100, "shrine": 75, "bell": 10, "pump": 3}
 _TOGGLE_TYPES = ("lantern", "hearth", "stall")
 _OCCUPANCY_TYPES = ("bench", "repair_bench")
 _IDLE_EMOTES = tuple(emote for emote in action.EMOTES if emote != "sleep")
@@ -17,23 +18,13 @@ _TASK_TYPES = frozenset(
     {"plot", "shrine", "pump", "bell", "stall", "lantern", "hearth", "bench", "repair_bench", "board"}
 )
 _STUCK_TICKS_LIMIT = 30  # abandon a destination after this many ticks of near-zero movement
+_GREET_COOLDOWN_TICKS = 100  # per person, so a lingering neighbour isn't greeted every tick
 
 
 def _cell_centre(cell: dict[str, int]) -> dict[str, float]:
     """Return the point at the centre of one village cell."""
 
     return {"x": cell["x"] + 0.5, "y": cell["y"] + 0.5}
-
-
-def _prop_use_ticks(prop_type: str) -> int:
-    """How many ticks to hold "use" on a prop, based on its catalog transition type."""
-    if prop_type in _TIMED_USE_TICKS:
-        return _TIMED_USE_TICKS[prop_type]
-    if prop_type in _TOGGLE_TYPES:
-        return 3
-    if prop_type in _OCCUPANCY_TYPES:
-        return 4
-    return 1  # e.g. "board": no state to hold, just a passing glance
 
 
 def _nearest_walkable_cell(observation, cell, max_radius=15):
@@ -112,6 +103,19 @@ class Agent:
         self._path_destination = None  # (x, y) tuple of cached path's target
         self.stuck_ticks = 0  # consecutive near-zero-movement ticks while walking a destination
 
+        # Greeting handed from act() to chat(), which the harness calls later the same tick
+        self._pending_chat = None
+
+    def _prop_use_ticks(self, prop_type: str) -> int:
+        """How many ticks to hold "use" on a prop, based on its catalog transition type."""
+        if prop_type in _TIMED_USE_TICKS:
+            return _TIMED_USE_TICKS[prop_type]
+        if prop_type in _TOGGLE_TYPES:
+            return self.rng.randint(5, 8)
+        if prop_type in _OCCUPANCY_TYPES:
+            return self.rng.randint(5, 8)
+        return 1  # e.g. "board": no state to hold, just a passing glance
+
     def _walk_toward(self, destination: dict[str, float], observation: ThreeBranchesObservation) -> float:
         """Heading toward destination, following a cached path around obstacles."""
         here = me.position(observation)
@@ -168,17 +172,58 @@ class Agent:
             return _cell_centre(_nearest_walkable_cell(observation, cell))
         return here
 
+    def _react_to_people(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction | None:
+        """Stop and turn toward whoever just showed up, or None when nobody is due a reaction.
+
+        Reactions outrank every task, so this runs before the phase logic. Pausing mid-use costs
+        nothing: the use counter simply doesn't advance this tick and resumes on the next one.
+        """
+        here = me.position(observation)
+        tick = day.tick(observation)
+        seen = people.seen(observation)
+        seen_ids = {person["id"] for person in seen}
+
+        def due(player_id: str) -> bool:
+            return tick - self.greeted.get(player_id, -_GREET_COOLDOWN_TICKS) >= _GREET_COOLDOWN_TICKS
+
+        # The visitor comes first: wave, and hand chat() a greeting to send this tick
+        visitor = next((person for person in seen if people.is_visitor(person["id"])), None)
+        if visitor is not None and due(visitor["id"]):
+            self.greeted[visitor["id"]] = tick
+            self._pending_chat = {"to": visitor["id"], "text": "Hello."}
+            return action.stand(geometry.heading_to(here, visitor["position"]), "wave")
+
+        for person in seen:
+            if not people.is_visitor(person["id"]) and due(person["id"]):
+                self.greeted[person["id"]] = tick
+                return action.stand(geometry.heading_to(here, person["position"]), "nod")
+
+        # Heard but not seen means they are in the blind spot behind us, so startle
+        for person in people.nearby(observation):
+            if person["id"] not in seen_ids and due(person["id"]):
+                self.greeted[person["id"]] = tick
+                return action.stand(geometry.heading_to(here, person["position"]), "startle")
+
+        return None
+
     def act(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
         """Choose one action from current observation and persistent day state."""
 
         here = me.position(observation)
         heading = me.heading(observation)
 
-        # Phase: plot (tend home plot for 150 ticks, then switch to wander)
+        reaction = self._react_to_people(observation)
+        if reaction is not None:
+            return reaction
+
+        # Phase: plot (tend the home plot, then switch to wander)
         if self.phase == "plot":
             if self.active_task is None:
                 # Initialize plot task
-                self.active_task = {"prop_id": self.claimed_plot["id"], "ticks_remaining": 150}
+                self.active_task = {
+                    "prop_id": self.claimed_plot["id"],
+                    "ticks_remaining": self._prop_use_ticks(self.claimed_plot["type"]),
+                }
                 self.use_counter = 0
 
             if self.use_counter >= self.active_task["ticks_remaining"]:
@@ -204,7 +249,10 @@ class Agent:
             if self.active_task is None:
                 usable = props.usable(observation)
                 if usable is not None and usable["id"] not in self.used_props:
-                    self.active_task = {"prop_id": usable["id"], "ticks_remaining": _prop_use_ticks(usable["type"])}
+                    self.active_task = {
+                        "prop_id": usable["id"],
+                        "ticks_remaining": self._prop_use_ticks(usable["type"]),
+                    }
                     self.use_counter = 0
 
             if self.active_task is not None:
@@ -248,5 +296,10 @@ class Agent:
     # its previous turn. Return messages with a recipient and text, or nothing to stay silent.
     # Use None as the recipient to broadcast. Every message is recorded and shown in replays.
     #
-    # def chat(self, inbox: list[dict]) -> list[dict] | None:
-    #     ...
+    def chat(self, inbox: list[dict]) -> list[dict] | None:
+        """Send the greeting act() queued when it waved at the visitor."""
+        if self._pending_chat is None:
+            return None
+        message = self._pending_chat
+        self._pending_chat = None
+        return [message]
